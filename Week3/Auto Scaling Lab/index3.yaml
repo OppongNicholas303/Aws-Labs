@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto Scaling Lab: Apache web server that scales based on CPU utilization'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+    ConstraintDescription: Must be a valid EC2 instance type
+
+  SSHLocation:
+    Description: The IP address range that can SSH to EC2 instances
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: Must be a valid IP CIDR range
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Auto Scaling Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Auto Scaling Lab IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet 2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: Private Subnet 1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: Private Subnet 2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private Route Table 1
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable1
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        ImageId: ami-0fc5d935ebf8bc3bc  # Amazon Linux 2 AMI (adjust for your region)
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            yum install -y httpd stress
+            
+            # Start Apache
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Get instance metadata
+            TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+            
+            # Create index.html with instance info and CPU stress button
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Auto Scaling Demo</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        margin: 40px;
+                        line-height: 1.6;
+                    }
+                    .container {
+                        max-width: 800px;
+                        margin: 0 auto;
+                        padding: 20px;
+                        border: 1px solid #ddd;
+                        border-radius: 5px;
+                        background-color: #f9f9f9;
+                    }
+                    h1 {
+                        color: #333;
+                    }
+                    .info {
+                        background-color: #e9f7fe;
+                        padding: 15px;
+                        border-radius: 5px;
+                        margin: 20px 0;
+                        font-size: 18px;
+                    }
+                    button {
+                        background-color: #ff5c5c;
+                        color: white;
+                        border: none;
+                        padding: 12px 24px;
+                        font-size: 16px;
+                        border-radius: 4px;
+                        cursor: pointer;
+                        transition: background-color 0.3s;
+                    }
+                    button:hover {
+                        background-color: #ff3333;
+                    }
+                    #status {
+                        margin-top: 20px;
+                        font-weight: bold;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>Auto Scaling Demo</h1>
+                    <div class="info">
+                        <p>Hello from <strong>${PRIVATE_IP}</strong> / <strong>${INSTANCE_ID}</strong></p>
+                    </div>
+                    <p>Click the button below to stress the CPU. This will trigger the Auto Scaling Group to launch a new instance when CPU utilization exceeds 50%.</p>
+                    <button id="stressButton">Stress CPU (2 minutes)</button>
+                    <div id="status"></div>
+                    
+                    <script>
+                        document.getElementById('stressButton').addEventListener('click', function() {
+                            this.disabled = true;
+                            const status = document.getElementById('status');
+                            status.textContent = 'Stressing CPU...';
+                            
+                            // Make AJAX request to the stress endpoint
+                            fetch('/stress.php')
+                                .then(response => {
+                                    if (!response.ok) {
+                                        throw new Error('Network response was not ok');
+                                    }
+                                    return response.text();
+                                })
+                                .then(data => {
+                                    status.textContent = data;
+                                    setTimeout(() => {
+                                        this.disabled = false;
+                                        status.textContent = 'CPU stress completed. You can run it again.';
+                                    }, 120000); // 2 minutes
+                                })
+                                .catch(error => {
+                                    status.textContent = 'Error: ' + error.message;
+                                    this.disabled = false;
+                                });
+                        });
+                    </script>
+                </div>
+            </body>
+            </html>
+            EOF
+            
+            # Create PHP script to handle CPU stress
+            cat > /var/www/html/stress.php << EOF
+            <?php
+            // Run stress command in background
+            exec('nohup stress --cpu 1 --timeout 120s > /dev/null 2>&1 &');
+            echo "CPU stress started. Running for 2 minutes at high utilization.";
+            ?>
+            EOF
+            
+            # Set permissions
+            chown -R apache:apache /var/www/html
+            chmod 755 /var/www/html
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-tg
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}-asg
+      MinSize: 1
+      DesiredCapacity: 1
+      MaxSize: 3
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-web-server
+          PropagateAtLaunch: true
+
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0  # 50% CPU utilization threshold
+        DisableScaleIn: false
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: DNS Name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerDNSName
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref WebServerAutoScalingGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-AutoScalingGroupName
