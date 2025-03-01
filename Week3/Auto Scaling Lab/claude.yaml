@@ -1,0 +1,445 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'Auto Scaling Lab - Dynamic Scaling of Apache Web Servers with CPU-based scaling'
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+  
+  AllowedSSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: IP CIDR range allowed for SSH access (recommend restricting to your IP)
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: AutoScalingGroup-VPC
+
+  # Public subnet 1 for ALB
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: "10.0.0.0/24"
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      VpcId: !Ref VPC 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-PublicSubnet1
+
+  # Public subnet 2 for ALB
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: "10.0.1.0/24"
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      VpcId: !Ref VPC 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-PublicSubnet2
+
+  # Private subnet for ASG
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: "10.0.2.0/24"
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      VpcId: !Ref VPC 
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-PrivateSubnet
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: ASG-Lab-InternetGateway
+
+  # Attach Internet Gateway to VPC
+  AttachedGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route table for public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-PublicRouteTable
+
+  # Public route in the route table
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachedGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate the route table with the public subnets
+  Public1SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Public2SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: AutoScaling-NAT
+
+  # EIP For NAT Gateway
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachedGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: AutoScaling-NAT-EIP
+
+  # Private Route Table - ADDED
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-PrivateRouteTable
+
+  # Private Route through NAT Gateway - ADDED
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # Associate Private Subnet with Private Route Table - ADDED
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security Groups
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH from Bastion
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1  # Allow all outbound traffic - MODIFIED
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AutoScaling-InstanceSG
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AutoScaling-Lab-ALBSG
+
+  # Application Load Balancer (ALB)
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: AutoScaling-ALB
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: AutoScaling-Lab-ALB
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: AutoScaling-TG
+      HealthCheckPath: /index.html  # MODIFIED: More specific health check path
+      HealthCheckIntervalSeconds: 15  # MODIFIED: Reduced from 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3  # MODIFIED: Reduced from 5
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: AutoScaling-TargetGroup
+
+  # IAM Role for EC2 instances to access CloudWatch
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: /
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  # Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: AutoScaling-LaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        ImageId: ami-0fc5d935ebf8bc3bc # Amazon Linux 2 in us-east-1
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash -xe
+            # Enable command tracing for better debugging
+            exec > >(tee /var/log/user-data.log) 2>&1
+            
+            # Update system and install packages
+            yum update -y
+            yum install -y httpd amazon-cloudwatch-agent
+            
+            # Manually install stress-ng if not available in repos
+            if ! yum list installed stress-ng &>/dev/null; then
+              amazon-linux-extras install epel -y
+              yum install -y stress-ng
+            fi
+            
+            # Start Apache and enable it on boot
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Create a simple index page for testing
+            echo "<html><head><title>Auto Scaling Lab</title></head><body>" > /var/www/html/index.html
+            echo "<h1>Hello from $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</h1>" >> /var/www/html/index.html
+            echo "<p>Private IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)</p>" >> /var/www/html/index.html
+            echo "<p><button onclick=\"stressTest()\">Stress CPU</button></p>" >> /var/www/html/index.html
+            echo "<p id=\"status\"></p>" >> /var/www/html/index.html
+            
+            # Add JavaScript to trigger stress test
+            cat >> /var/www/html/index.html << 'EOF'
+            <script>
+            function stressTest() {
+              document.getElementById("status").innerHTML = "Stressing CPU for 120 seconds...";
+              fetch('/stress.php')
+                .then(response => response.text())
+                .then(data => {
+                  console.log(data);
+                  setTimeout(function() {
+                    document.getElementById("status").innerHTML = "CPU stress test completed!";
+                  }, 120000);
+                })
+                .catch(error => {
+                  console.error('Error:', error);
+                  document.getElementById("status").innerHTML = "Error occurred during stress test!";
+                });
+            }
+            </script>
+            </body></html>
+            EOF
+            
+            # Install PHP for a simpler stress test implementation
+            yum install -y php
+            
+            # Create a PHP script for stress testing (simpler than CGI)
+            cat > /var/www/html/stress.php << 'EOF'
+            <?php
+            header('Content-Type: text/plain');
+            echo "Starting CPU stress test...\n";
+            // Run stress-ng in the background
+            exec('nohup stress-ng --cpu 2 --cpu-load 90 --timeout 120s > /dev/null 2>&1 &');
+            echo "CPU stress test initiated. Will run for 120 seconds.";
+            ?>
+            EOF
+            
+            # Create a simple health check page
+            echo "OK" > /var/www/html/health.html
+            
+            # Start the CloudWatch agent
+            systemctl enable amazon-cloudwatch-agent
+            systemctl start amazon-cloudwatch-agent
+            
+            # Restart Apache to apply changes
+            systemctl restart httpd
+            
+            echo "User data script completed successfully" > /var/log/user-data-status.log
+
+  # Auto Scaling Group (ASG)
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: ASG-Lab-AutoScalingGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: ASG-Lab-Instance
+          PropagateAtLaunch: true
+
+  # CPU Alarm and Scaling Policy
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ASG-Lab-HighCPUAlarm
+      AlarmDescription: Scale up if CPU > 50% for 2 consecutive periods
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASG
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+
+  # Scale In Policy and Alarm - ADDED
+  CPUAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ASG-Lab-LowCPUAlarm
+      AlarmDescription: Scale down if CPU < 5% for 3 consecutive periods
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASG
+      AlarmActions:
+        - !Ref ScaleInPolicy
+
+  # Simple Scaling Policies
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 60
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 60
+
+Outputs:
+  LoadBalancerURL:
+    Description: URL of the deployed ALB
+    Value: !Join [ "", [ "http://", !GetAtt ALB.DNSName ] ]
+  
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+  
+  PublicSubnets:
+    Description: Public Subnets (comma separated)
+    Value: !Join [ ",", [ !Ref PublicSubnet1, !Ref PublicSubnet2 ] ]
+  
+  PrivateSubnet:
+    Description: Private Subnet
+    Value: !Ref PrivateSubnet
