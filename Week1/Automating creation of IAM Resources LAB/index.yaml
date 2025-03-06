@@ -99,6 +99,7 @@ Resources:
                   - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/iam/s3-user/email' 
 
   # Lambda Function
+  
   UserCreationNotifier:
     Type: AWS::Lambda::Function
     Properties:
@@ -170,7 +171,7 @@ Resources:
         - Arn: !GetAtt UserCreationNotifier.Arn
           Id: "UserCreationLambda"
 
-  # Lambda Permission for EventBridge
+  # Lambda Permission for EventBridge to trigger the Lambda function.
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -179,13 +180,13 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt UserCreationRule.Arn
 
-  Resources:
-  MyStack:
-    Type: AWS::CloudFormation::Stack
-    Properties:
-      Tags:
-        - Key: ForceUpdate
-          Value: !Ref "AWS::Timestamp"
+  # Resources:
+  # MyStack:
+  #   Type: AWS::CloudFormation::Stack
+  #   Properties:
+  #     Tags:
+  #       - Key: ForceUpdate
+  #         Value: !Ref "AWS::Timestamp"
 
 
 Outputs:
